@@ -2,34 +2,40 @@
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/FluidPressure.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/TwistStamped.h>
+#include <sensor_msgs/NavSatFix.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/time_synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
 #include "eskf.hpp"
 #include <fstream>  // 用于文件操作
-#include <geometry_msgs/Twist.h>
 
 
 class ESKFNode {
 private:
     ros::NodeHandle nh_;
     ros::Subscriber imu_sub_;
-    ros::Subscriber pressure_sub_;
+    ros::Subscriber gps_position_sub_;
     ros::Publisher state_pub_;
-    // ros::Publisher cmd_pub_;
-
     ESKF eskf_;
 
 public:
     ESKFNode() {
         // Initialize subscribers and publishers
-        imu_sub_ = nh_.subscribe("/iris_0/mavros/imu/data", 100, &ESKFNode::imuCallback, this);
-        pressure_sub_ = nh_.subscribe("/iris_0/mavros/imu/static_pressure", 100, &ESKFNode::pressureCallback, this);
-        state_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/eskf/state_estimation", 100);
+        imu_sub_ = nh_.subscribe("/iris_0/mavros/imu/data", 20, &ESKFNode::imuCallback, this);
+        gps_position_sub_ = nh_.subscribe("/iris_0/mavros/global_position/raw/fix", 20, &ESKFNode::gpsCallback, this);
+        // gps_vel_sub_.subscribe(nh_, "/iris_0/mavros/global_position/raw/gps_vel", 5);
+
+
+        // 发布状态估计结果的话题
+        state_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/eskf/state_estimation", 1);
         // cmd_pub_ = nh_.advertise<geometry_msgs::Twist>("/iris_0/mavros/setpoint_attitude/cmd_vel", 100);
         // Configure ESKF options
         ESKF::Options options;
-        options.bias_gyro_var = 1e-5;
-        options.bias_acc_var = 1e-5;
-        options.gyro_var = 1e-5;
-        options.acc_var = 1e-5;
+        options.bias_gyro_var = 1e-3;
+        options.bias_acc_var = 1e-3;
+        options.gyro_var = 1e-3;
+        options.acc_var = 1e-3;
         options.imu_dt = 0.02;
 
         // Initialize ESKF
@@ -50,8 +56,13 @@ public:
         eskf_.PressureObserver(*msg);
     }
 
+    void gpsCallback(const sensor_msgs::NavSatFix& gps_position) {
+        eskf_.GNSSObserve(gps_position);
+        ROS_INFO("GNSS观测成功!");
+    }
+
     void publishState(const ros::Time& stamp) {
-         // 打开一个文本文件（以追加模式）
+         // 打开文本文件（以追加模式）
         std::ofstream outFile;
         outFile.open("/home/dcbin/catkin_ws/src/eskf_pkg/output.txt", std::ios::app);
 
@@ -60,12 +71,12 @@ public:
         state_msg.header.frame_id = "map";
 
         ESKF::Vec3 p = eskf_.getp();
+        ESKF::Vec3 v = eskf_.getV();
         ESKF::SO3 R = eskf_.getR();
 
         state_msg.pose.position.x = p(0);
         state_msg.pose.position.y = p(1);
         state_msg.pose.position.z = p(2);
-
         Eigen::Quaterniond q(R);
         state_msg.pose.orientation.x = q.x();
         state_msg.pose.orientation.y = q.y();
@@ -83,7 +94,9 @@ public:
     }
 };
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
+    setlocale(LC_ALL, "zh_CN.UTF-8");
     ros::init(argc, argv, "eskf_node");
     ESKFNode node;
     ros::spin();

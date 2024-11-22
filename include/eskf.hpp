@@ -9,7 +9,10 @@
 #include <sensor_msgs/FluidPressure.h>
 #include <sophus/so3.hpp>
 #include <sophus/se3.hpp>
-
+#include <sensor_msgs/NavSatFix.h> //GPS经纬度数据
+#include <geometry_msgs/TwistStamped.h> // GPS速度观测
+#include <deque>
+#include <mutex>
 
 /**
  * 使用前需要准备好以下参数：
@@ -32,10 +35,10 @@ public:
         double imu_dt;
 
         Options() 
-            : bias_gyro_var(1e-4), 
-            bias_acc_var(1e-4), 
-            gyro_var(1e-4), 
-            acc_var(1e-4), 
+            : bias_gyro_var(1e-3), 
+            bias_acc_var(1e-3), 
+            gyro_var(1e-3), 
+            acc_var(1e-3), 
             imu_dt(0.02) 
         {}
     };
@@ -54,15 +57,17 @@ public:
     using Imu = sensor_msgs::Imu;
     using HMat = Eigen::Matrix<double, 6, 18>;
     using SE3 = Sophus::SE3d;
+    using GPS_position = sensor_msgs::NavSatFix;
+    using GPS_vel = geometry_msgs::TwistStamped;
 
- 
+    std::deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
     // 名义状态变量
     Vec3 p_ = Vec3::Zero(); //位置的名义状态变量
     Vec3 v_ = Vec3::Zero(); //速度的名义状态变量
     SO3 R_ = SO3::Identity(); //旋转矩阵的名义状态变量
     Vec3 bg_ = Vec3::Zero(); //角速度零偏的名义状态变量
     Vec3 ba_ = Vec3::Zero(); //角速度零偏的名义状态变量
-    Vec3 g_{0, 0, -9.8}; //重力加速度的名义状态变量
+    Vec3 g_{0, 0, -9.81}; //重力加速度的名义状态变量
 
     // 18维的误差状态变量，从这里也可以看出使用误差状态变量的优势：状态变量都是向量,
     // 不存在矩阵.由6个三维列向量组成，依次为：dp、dv、dtheta、dbg、dba、dg
@@ -75,10 +80,13 @@ public:
     Mat18 P_ = Mat18::Identity();
 
     // 观测方程噪声协方差矩阵V
-    Mat6 V_ = Mat6::Identity() * 1e-4;
+    Mat6 V_ = Mat6::Identity() * 1e-5;
 
     // 初始气压计读数
     double first_pressure = 0;
+
+    // 初始GPS读数
+    GPS_position first_GPS_data;
 
     // 记录当前时间戳
     double current_time = 0;
@@ -87,6 +95,8 @@ public:
     bool first_pressure_tag = true;
     // 是否为首个IMU数据
     bool first_imu_tag = true;
+    // 是否为首个GNSS数据
+    bool first_GPS_tag = true;
 
     // 误差状态变量的过程噪声协方差矩阵Q的参数配置
     Options options_;
@@ -94,9 +104,9 @@ public:
 public:
     ESKF(const Options& options = Options())
         :options_(options){}
-
     bool Predict(const Imu& imu_data);
     bool PressureObserver(const sensor_msgs::FluidPressure& pressure);
+    bool GNSSObserve(const GPS_position& gps_data);
     bool ObserveSE3(const SE3& SE3_,
                         const HMat& H = HMat::Zero(),
                         const Mat6& V = Mat6::Zero());
@@ -214,6 +224,58 @@ bool ESKF::PressureObserver(const sensor_msgs::FluidPressure& pressure)
 }
 
 /**
+ * 使用GNSS提供的速度数据和位置观测进行滤波器更新
+ * @param gps_data sensor_msgs::NavSatFix；当前GNSS经纬度观测
+ * @param gps_vel geometry_msgs::TwistStamped；当前GNSS速度观测值
+ */
+bool ESKF::GNSSObserve(const GPS_position& gps_data)
+{
+    const double R = 6378137; // 地球半径，单位：m
+    if(first_GPS_tag)
+    {
+        first_GPS_data = gps_data;
+        first_GPS_tag = false;
+        this->current_time = gps_data.header.stamp.toSec();
+    }
+
+    // 经纬度转ENU,得到GNSS位置观测
+    auto f = [&R](const GPS_position& first_GPS_data, const GPS_position& gps_data) -> Vec3{
+        double lat_rad = (gps_data.latitude - first_GPS_data.latitude) * M_PI / 180.0; // 纬度差转弧度
+        double lon_rad = (gps_data.longitude - first_GPS_data.longitude) * M_PI / 180.0; // 经度差转弧度
+        double x = R * lon_rad * cos(first_GPS_data.latitude * M_PI / 180.0);
+        double y = R * lat_rad;
+        double z = gps_data.altitude - first_GPS_data.altitude;
+        return Vec3(x, y, z);
+    };
+
+    Vec3 p_observe = f(first_GPS_data, gps_data); // 位置观测
+    Vec3 delta_p = p_observe - p_;
+    // if(delta_p.norm() > 0.5)
+    // {
+    //     p_ = p_observe;
+    //     return false;
+    // }
+    // Vec3 v_observe(gps_vel.twist.linear.x,
+    //                gps_vel.twist.linear.y,
+    //                gps_vel.twist.linear.z); // 速度观测
+    // HMat H = HMat::Zero();
+    // H.block<3, 3>(3, 3) = Mat3::Identity();
+    // Mat18x6 K = P_ * H.transpose() * (H * P_ * H.transpose() + V_).inverse();
+    // Vec6 innov = Vec6::Zero();
+    // innov.block<3, 1>(0, 0) = p_observe - p_;
+    // innov.block<3, 1>(3, 0) = v_observe - v_;
+    Eigen::Matrix<double, 3, 18> H = Eigen::Matrix<double, 3, 18>::Zero();
+    H.block<3, 3>(0, 0) = Mat3::Identity();
+    Eigen::Matrix<double, 18, 3> K = P_ * H.transpose() * (H * P_ * H.transpose() + V_.block<3, 3>(0, 0)).inverse();
+    Vec3 innov = p_observe - p_;
+    dx_ = dx_ + K * innov; //因为dx_每一次都会被置零，所以高博的代码中没有加上dx_
+    P_ = (Mat18::Identity() - K * H) * P_;
+    UpdateAndReset();
+    this->current_time = gps_data.header.stamp.toSec();
+    return true;
+}
+
+/**
  * 使用卡尔曼滤波更新误差状态变量和协方差矩阵P,观测函数应该提供:\n
  * 观测数据(以4X4的SE(3)矩阵表示观测数据)、观测矩阵、观测噪声的方差给这个方法。
  * 这里只考虑了对姿态和位置的观测，没有对速度的观测
@@ -244,7 +306,7 @@ void ESKF::UpdateAndReset()
     p_ = p_ + dx_.block<3, 1>(0, 0);
     v_ = v_ + dx_.block<3, 1>(3, 0);
     R_ = R_ * (Sophus::SO3d::exp(dx_.block<3, 1>(6, 0))).matrix();
-    // UpdateP_(); 加入P_的修正导致数值发散
+    // UpdateP_(); // 加入P_的修正导致数值发散
     dx_.setZero();
 }
 

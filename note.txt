@@ -1,0 +1,2 @@
+速度观测：/iris_0/mavros/global_position/raw/gps_vel
+GPS的位置和速度观测的同步

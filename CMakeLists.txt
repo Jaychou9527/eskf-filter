@@ -14,12 +14,13 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
   sensor_msgs
+  message_filters
 )
 
 find_package(Eigen3 REQUIRED)
 find_package(Sophus REQUIRED)
 ## System dependencies are found with CMake's conventions
-# find_package(Boost REQUIRED COMPONENTS system)
+find_package(Boost REQUIRED COMPONENTS system)
 
 
 ## Uncomment this if the package has a setup.py. This macro ensures
@@ -117,7 +118,6 @@ catkin_package(
 ###########
 ## Build ##
 ###########
-message(STATUS "Eigen3 Include Directory: ${EIGEN3_INCLUDE_DIR}")
 
 ## Specify additional locations of header files
 ## Your package locations should be listed before other locations
